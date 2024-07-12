@@ -2,8 +2,18 @@ mod geometry;
 mod renderer;
 mod scene;
 
+use core::time;
+use std::{
+    mem::MaybeUninit,
+    time::{Duration, Instant},
+};
+
 use log::{log, Level};
 
+use wgpu::{
+    util::{DeviceExt, RenderEncoder},
+    BufferUsages,
+};
 use winit::{
     event::{ElementState, Event, KeyEvent, WindowEvent},
     event_loop::EventLoop,
@@ -18,45 +28,37 @@ use scene::Scene;
 fn main() {
     env_logger::init();
 
+    #[rustfmt::skip]
     let geometries = vec![Geometry::new(
         vec![
-            Vertex {
-                position: [-0.0868241, 0.49240386, 0.0],
-                color: [0.5, 0.0, 0.5],
-            }, // A
-            Vertex {
-                position: [-0.49513406, 0.06958647, 0.0],
-                color: [0.5, 0.0, 0.5],
-            }, // B
-            Vertex {
-                position: [-0.21918549, -0.44939706, 0.0],
-                color: [0.5, 0.0, 0.5],
-            }, // C
-            Vertex {
-                position: [0.35966998, -0.3473291, 0.0],
-                color: [0.5, 0.0, 0.5],
-            }, // D
-            Vertex {
-                position: [0.44147372, 0.2347359, 0.0],
-                color: [0.5, 0.0, 0.5],
-            }, // E
+            Vertex { position: [-0.5, -0.5, -0.3], color: [1.0, 1.0, 1.0] },
+            Vertex { position: [0.5, -0.5, -0.3], color: [1.0, 1.0, 1.0] },
+            Vertex { position: [0.5, 0.5, -0.3], color: [1.0, 1.0, 1.0] },
+            Vertex { position: [-0.5, 0.5, -0.3], color: [1.0, 1.0, 1.0] },
+            Vertex { position: [0.0, 0.0, 0.5], color: [0.5, 0.5, 0.5] },
         ],
-        vec![0, 1, 4, 1, 2, 4, 2, 3, 4],
+        vec![
+             0, 1, 2, 
+             0, 2, 3, 
+
+             0, 1, 4,
+             1, 2, 4,
+             2, 3, 4,
+             3, 0, 4,
+        ],
     )];
 
-    let scene = TestScene { geometries };
+    let scene = TestScene::new(geometries);
 
     pollster::block_on(run(scene));
 }
 
-pub async fn run<T>(mut scene: T)
-where
-    T: Scene,
-{
+pub async fn run(mut scene: impl Scene) {
     let event_loop = EventLoop::new().unwrap();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
     let mut renderer = Renderer::new(&window).await;
+    scene.initialize_buffers(&renderer);
 
     let result = event_loop.run(move |event, control_flow| match event {
         Event::WindowEvent {
@@ -79,6 +81,8 @@ where
             },
 
             WindowEvent::RedrawRequested if window_id == renderer.window.id() => {
+                scene.tick(&renderer);
+
                 match scene.render(&renderer) {
                     Ok(_) => {}
                     Err(wgpu::SurfaceError::Lost) => renderer.resize(renderer.size),
@@ -100,15 +104,64 @@ where
     }
 }
 
+#[repr(C)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+struct State {
+    time: f32,
+}
+
 struct TestScene {
     geometries: Vec<Geometry>,
+    time: Instant,
+    state: State,
+    state_buffer: Option<wgpu::Buffer>,
+}
+
+impl TestScene {
+    fn new(geometries: Vec<Geometry>) -> Self {
+        let time = Instant::now();
+
+        Self {
+            geometries,
+            time,
+            state: State {
+                time: time.elapsed().as_secs_f32(),
+            },
+            state_buffer: None,
+        }
+    }
 }
 
 impl Scene for TestScene {
-    fn render(&mut self, renderer: &Renderer) -> Result<(), wgpu::SurfaceError> {
+    fn initialize_buffers(&mut self, renderer: &Renderer) {
+        // initialize buffers
         for geometry in &mut self.geometries {
             geometry.initialize_buffers(&renderer.device);
         }
+
+        let state_buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: std::mem::size_of::<State>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+
+        self.state_buffer = Some(state_buffer);
+    }
+
+    fn tick(&mut self, renderer: &Renderer) {
+        let elapsed = self.time.elapsed();
+
+        self.state.time = elapsed.as_secs_f32();
+
+        if let Some(ref buffer) = self.state_buffer {
+            renderer
+                .queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[self.state]));
+        }
+    }
+
+    fn render(&mut self, renderer: &Renderer) -> Result<(), wgpu::SurfaceError> {
         let shader = renderer
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -116,12 +169,40 @@ impl Scene for TestScene {
                 source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
             });
 
+        let state_bind_group_layout =
+            renderer
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+
+        let state_bind_group = renderer
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &state_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.state_buffer.as_ref().unwrap().as_entire_binding(),
+                }],
+                label: None,
+            });
+
         let render_pipeline_layout =
             renderer
                 .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("Render Pipeline Layout"),
-                    bind_group_layouts: &[],
+                    bind_group_layouts: &[&state_bind_group_layout],
                     push_constant_ranges: &[],
                 });
 
@@ -149,7 +230,7 @@ impl Scene for TestScene {
                         topology: wgpu::PrimitiveTopology::TriangleList,
                         strip_index_format: None,
                         front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: Some(wgpu::Face::Back),
+                        cull_mode: None,
                         polygon_mode: wgpu::PolygonMode::Fill,
                         unclipped_depth: false,
                         conservative: false,
@@ -192,6 +273,7 @@ impl Scene for TestScene {
             });
 
             render_pass.set_pipeline(&render_pipeline);
+            render_pass.set_bind_group(0, &state_bind_group, &[]);
 
             for geometry in &self.geometries {
                 geometry.render(&mut render_pass);

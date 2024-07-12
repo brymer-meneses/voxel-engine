@@ -9,21 +9,28 @@ struct VertexInput {
     @location(1) color: vec3<f32>,
 }
 
+struct State {
+    @location(0) time: f32,
+}
+
+@group(0) @binding(0) var<uniform> state: State;
 
 
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.color = in.color;
-
+    let angle = state.time;
+    let alpha = cos(angle);
+    let beta = sin(angle);
 
     var position = vec3f(
         in.position.x,
-        in.position.y + 0.5 * in.position.z,
-        in.position.z + 0.5 * in.position.y,
+        alpha * in.position.y + beta * in.position.z,
+        alpha * in.position.z - beta * in.position.y,
     );
+    out.position = vec4f(position.x, position.y, 0.0, 1.0);
+    out.color = in.color;
 
-    out.position = vec4<f32>(position.x, position.y * 1.2, 0.0, 1.0);
     return out;
 }
 
